@@ -26,6 +26,8 @@ int numDone = 0;
 int ofs = 1;
 // Removed IOBusy, blockStart, blockEnd - I/O utilization will be calculated from process IOTime
 
+
+
 // Battery and Power Management
 double batteryLevel = 100.0;  // Battery percentage (0-100)
 double initialBattery = 100.0;
@@ -50,6 +52,7 @@ double dvfsSpeedMultiplier[] = {0.5, 0.75, 1.0};   // Speed scaling factors
 int totalMemory = 4096;  // Total system memory in MB
 int availableMemory = 4096;  // Available memory in MB
 int usedMemory = 0;  // Currently used memory in MB
+int peakUsedMemory = 0; // NEW: Tracks the maximum memory used concurrently
 map<int, int> processMemory;  // PID -> memory allocation in MB
 int memoryLeakCounter = 0;  // Track potential memory leaks
 
@@ -200,6 +203,11 @@ bool allocateMemory(PCB* pcb, int memoryMB) {
         usedMemory += memoryMB;
         pcb->memoryAllocated = memoryMB;
         processMemory[pcb->PID] = memoryMB;
+        
+        // --- PEAK MEMORY UPDATE ---
+        peakUsedMemory = max(peakUsedMemory, usedMemory);
+        // --------------------------
+        
         return true;
     }
     return false;  // Insufficient memory
@@ -276,9 +284,9 @@ struct DESLayer {
 
     void addEvent(Event& newEvent) { 
         if (printAddRmEvent) {
-            cout << "  " << "AddEvent" << "("<< newEvent.evtTimeStamp << ":" << newEvent.evtProcess->PID << ":" << getState(newEvent.newState) // Use getState for readability << ")" << ":"<< " ";
+            cout << "  " << "AddEvent" << "("<< newEvent.evtTimeStamp << ":" << newEvent.evtProcess->PID << ":" << getState(newEvent.newState) ;// Use getState for readability << ")" << ":"<< " ";
 
-            printEvents();
+            printEvents() ;
             cout << " ==>   ";
         }
         
@@ -380,7 +388,7 @@ struct Scheduler {
     virtual ~Scheduler() {}
 };
 
-// --- FCFS, LCFS, SRTF, RR definitions remain as provided ---
+// --- FCFS, SRTF, RR definitions remain as provided ---
 
 struct FCFS: public Scheduler {
     public:
@@ -395,18 +403,6 @@ struct FCFS: public Scheduler {
     void printQueues() {}  
 };
 
-struct LCFS: public Scheduler {
-    public:
-        deque<PCB*> runQ;
-    void addProcess(PCB* pcb) { runQ.push_back(pcb); };
-    PCB* getNextProcess() {
-        PCB* nextPCB = nullptr;
-        if (!runQ.empty()) { nextPCB = runQ.back(); runQ.pop_back(); }
-        return nextPCB;
-    }
-    bool testPreempt(PCB* unblockedPCB, PCB* runningPCB, int currentTime) { return false; } 
-    void printQueues() {}        
-};
 
 struct SRTF: public Scheduler {
     public:
@@ -619,8 +615,9 @@ struct BATTERY_AWARE: public Scheduler {
     }
 
     void printQueues() {
+        cout << "BATTERY_AWARE DECISION POINT: " ;
         cout << "BATTERY_AWARE: Battery=" << fixed << setprecision(1) << batteryLevel << "% ";
-        cout << "DVFS=" << (currentDVFS == LOW_POWER ? "LOW" : currentDVFS == BALANCED ? "BAL" : "HIGH") << endl;
+        cout << "DVFS=" << (currentDVFS == LOW_POWER ? "LOW" : currentDVFS == BALANCED ? "BAL" : "HIGH") << " MemoryUsed=" << usedMemory << "MB"<< endl;
     }
 };
 
@@ -630,6 +627,10 @@ void transition(PCB* pcb, int currentTime, stateEnum oldState, stateEnum newStat
     
     // Update energy consumption and battery level for the time spent RUNNING
     if (oldState == RUNNG) {
+        int ranFor = currentTime - pcb->runStart;
+cout << "GANTT_LOG: " << pcb->runStart << " to " << currentTime 
+     << " PID=" << pcb->PID << " END_RUN Duration=" << ranFor 
+     << " Reason=" << getState(newState) << endl;
         int runTime = currentTime - pcb->runStart;
         if (runTime > 0) {
             updateProcessEnergy(pcb, runTime, true);
@@ -647,8 +648,7 @@ void transition(PCB* pcb, int currentTime, stateEnum oldState, stateEnum newStat
         pcb->TC = pcb->TC - ranFor;
                 
         if (printTransition)  {    
-            cout << currentTime << " " << pcb->PID << " " << ranFor << ": " << getState(RUNNG) << " -> " << getState(newState) << " " << "cb=" << pcb->CPUBurst << " " << "rem=" << pcb->TC << " " ;
-                 << "prio=" << pcb->dynamicPriority << endl;
+            cout << currentTime << " " << pcb->PID << " " << ranFor << ": " << getState(RUNNG) << " -> " << getState(newState) << " " << "cb=" << pcb->CPUBurst << " " << "rem=" << pcb->TC << " " << "prio=" << pcb->dynamicPriority << endl;
         }
              
         pcb->dynamicPriority--;   
@@ -664,7 +664,16 @@ void transition(PCB* pcb, int currentTime, stateEnum oldState, stateEnum newStat
         
         // Allocate memory when process starts running
         if (pcb->memoryAllocated == 0) {
-            allocateMemory(pcb, 0);
+           if (allocateMemory(pcb, 0)) {
+                // --- ENHANCED PRINT FOR ALLOCATION ---
+                cout << "MEMORY_ALLOC: PID=" << pcb->PID 
+                     << " allocated " << pcb->memoryAllocated << "MB." 
+                     << " Available=" << availableMemory << "MB. Used=" << usedMemory << "MB." << endl;
+                // -------------------------------------
+            } else {
+                 // Important: Handle allocation failure if implementing true memory constraints
+                 cout << "MEMORY_FAIL: PID=" << pcb->PID << " failed to allocate memory! Remaining Available=" << availableMemory << "MB." << endl;
+            }
         }
 
         if (pcb->TC <= pcb->CPUBurst) { 
@@ -675,11 +684,17 @@ void transition(PCB* pcb, int currentTime, stateEnum oldState, stateEnum newStat
             pcb->CPUBurst = assignRandom(pcb->CB, randVals); 
         }  
 
+
+
         if (pcb->CPUBurst > pcb->TC) { 
             pcb->CPUBurst = pcb->TC;
-        }             
+        }       
+
+        double speedFactor = dvfsSpeedMultiplier[currentDVFS];
+        int adjustedQuantum = (int)(timeQuantum * (1.0 / speedFactor));      
 
         if (printTransition) { 
+            cout << "DVFS_IMPACT: SpeedFactor=" << fixed << setprecision(2) << speedFactor << " Adjusted Quantum=" << adjustedQuantum << endl;
             cout << currentTime << " " << pcb->PID << " " << currentTime - pcb->stateTimeStamp << ": " << getState(oldState) << " -> " << getState(newState) << " " << "cb=" << pcb->CPUBurst << " " << "rem=" << pcb->TC << " " << "prio=" << pcb->dynamicPriority << endl;  
         }           
     }
@@ -704,8 +719,13 @@ void transition(PCB* pcb, int currentTime, stateEnum oldState, stateEnum newStat
 
         } else if (pcb->TC == 0) { 
             // Deallocate memory when process completes
+            int freedMem = pcb->memoryAllocated;
             deallocateMemory(pcb);
             pcb->finishTime = currentTime;
+            cout << "MEMORY_DEALLOC: PID=" << pcb->PID << " freed " << freedMem << "MB. Available=" << availableMemory << "MB" << endl;
+
+            cout << "MEMORY_DEALLOC: PID=" << pcb->PID << " freed " << freedMem << "MB." << " Available=" << availableMemory << "MB. Used=" << usedMemory << "MB." << endl;
+
             pcb->turnAroundTime = pcb->finishTime - pcb->AT; // Corrected to use AT
             if (printTransition) { 
                 cout << currentTime << " " << pcb->PID << " " << ranFor << ": " 
@@ -742,13 +762,13 @@ int main(int argc, char* argv[]) {
 
         string userOption = argv[i];
 
-        if (userOption == "-v") { printTransition = true; continue; }
-        else if (userOption == "-t") { printReadyQ = true; continue; }  
-        else if (userOption == "-e") { printAddRmEvent = true; continue; }    
-        else if (userOption == "-p") { printPreemptProcess = true; continue; }  
+        if (userOption == "-v") { printTransition = false; continue; }
+        else if (userOption == "-t") { printReadyQ = false; continue; }  
+        else if (userOption == "-e") { printAddRmEvent = false; continue; }    
+        else if (userOption == "-p") { printPreemptProcess = false; continue; }  
         else if (userOption == "-s") { continue; }
 
-        else if (userOption.substr(0, 2) == "-s") { userOption.erase(0, 2); } // Simplified erase
+        else if (userOption.substr(0, 2) == "-s") { userOption.erase(0, 2); }
 
         if (userOption[0] == 'F') { schedulerType = "FCFS"; continue; }
         else if (userOption[0] == 'L') { schedulerType = "LCFS"; continue; }
@@ -766,7 +786,6 @@ int main(int argc, char* argv[]) {
             if (userOption[0] == 'P'){ schedulerType = "PRIO"; }
             else if (userOption[0] == 'E') { schedulerType = "PREPRIO"; }
             
-            // Extract quantum/maxPrio from string like P50:4 or E50:4
             size_t start = userOption[0] == 'P' ? 1 : 1;
             string remaining = userOption.substr(start);
 
@@ -809,11 +828,10 @@ int main(int argc, char* argv[]) {
 
     vector<int> randVals = readRandom(rfilePath);
 
-    Scheduler* scheduler;
+    Scheduler* scheduler = nullptr;
 
-    // Initialize schedulers with correct sizing
     if (schedulerType == "FCFS") { scheduler = new FCFS(); timeQuantum = 10000; }
-    else if (schedulerType == "LCFS") { scheduler = new LCFS(); timeQuantum = 10000; }
+    
     else if (schedulerType == "SRTF") { scheduler = new SRTF(); timeQuantum = 10000; }
     else if (schedulerType == "RR") { scheduler = new RR(); }
     else if (schedulerType == "PRIO") { 
@@ -833,7 +851,7 @@ int main(int argc, char* argv[]) {
     list<Event*> eventQ;
     DESLayer DES(eventQ);
 
-    Event* evt; 
+    Event* evt = nullptr; 
     bool callScheduler = false;    
     double totalSimTime = 0;
     int processNum = 0; 
@@ -859,7 +877,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        delete[] lineChar; // Correctly delete array
+        delete[] lineChar;
         PCBInputs.push_back(prio);
 
         PCB* pcb = new PCB(PCBInputs[0], PCBInputs[1], PCBInputs[2], PCBInputs[3], PCBInputs[4], PCBInputs[5]);
@@ -889,10 +907,6 @@ int main(int argc, char* argv[]) {
         switch(newState) { 
 
             case READY: {  
-                // This case handles process arrival (from oldState != RUNNG/BLOCK)
-                // and preemption/quantum expiry (from oldState == RUNNG)
-
-                // Only check for preemption if the process is newly unblocked/arrived
                 if (oldState == BLOCK || (oldState != RUNNG && pcb->stateTimeStamp == pcb->AT)) { 
                     
                     if (!runQueue.empty()) { 
@@ -901,28 +915,25 @@ int main(int argc, char* argv[]) {
                         preemptRunningPCB = scheduler->testPreempt(pcb, runningPCB, currentTime); 
 
                         if (preemptRunningPCB) { 
-                            // 1. Add arriving process to the scheduler
                             pcb->state = READY;
                             pcb->stateTimeStamp = currentTime;
                             scheduler->addProcess(pcb);                            
 
-                            // 2. Create preempt event for running process (will transition RUNNG->READY on next cycle)
                             DES.rmEvent(runningPCB); 
                             runningPCB->nextEventTime = currentTime;  
                             Event* event = new Event(runningPCB, READY, currentTime);
                             DES.addEvent(*event); 
-                            delete evt; // Delete current event
-                            callScheduler = true; // Schedule now to pick up the preempted process
+                            delete evt; 
+                            callScheduler = true; 
                             continue;              
                         }
                     }
                 } 
                 
-                // Process did not preempt or was returning from RUNNG/PREEMPT
                 pcb->state = READY;
                 pcb->stateTimeStamp = currentTime;    
                 
-                if (!preemptRunningPCB) { // Only add if not handled in the preemption block
+                if (!preemptRunningPCB) { 
                     scheduler->addProcess(pcb);
                 }
                 callScheduler = true; 
@@ -933,7 +944,6 @@ int main(int argc, char* argv[]) {
  
                 int adjustedQuantum = timeQuantum;
                 if (schedulerType == "RR" || schedulerType == "PREPRIO" || schedulerType == "BATTERY_AWARE") {
-                    // Adjust time quantum based on DVFS (slower CPU = longer effective quantum)
                     adjustedQuantum = (int)(timeQuantum * (1.0 / dvfsSpeedMultiplier[currentDVFS]));
                 }
                 
@@ -948,13 +958,11 @@ int main(int argc, char* argv[]) {
                 runQueue.push(pcb);                
 
                 if (minRemaining < pcb->CPUBurst) {      
-                    // Quantum expired (event leads to READY)
                     Event* event = new Event(pcb, READY, nextEventTime);
                     DES.addEvent(*event);
                 }
 
                 else {
-                    // CPU burst ended (event leads to BLOCK/DONE)
                     Event* event = new Event(pcb, BLOCK, nextEventTime);
                     DES.addEvent(*event);                                                        
                 }
@@ -987,25 +995,24 @@ int main(int argc, char* argv[]) {
         if (callScheduler == true) {
 
             if (DES.getNextEventTime() == currentTime) {    
-                delete evt; // Current event finished, but more at this time
+                delete evt; 
                 continue; 
             }
 
             callScheduler = false;
 
-            PCB* nextPCB = scheduler->getNextProcess(); // Get next process to run
+            if (runQueue.empty()) { 
 
-            if (printReadyQ) { 
-                scheduler->printQueues();
-            }
+                PCB* nextPCB = scheduler->getNextProcess(); 
     
-            if (nextPCB!=nullptr && runQueue.empty()) { // Only schedule if CPU is free
-                Event* event = new Event(nextPCB, RUNNG, currentTime); 
-                DES.addEvent(*event);  
-            }            
+                if (nextPCB!=nullptr) { 
+                    Event* event = new Event(nextPCB, RUNNG, currentTime); 
+                    DES.addEvent(*event);  
+                }            
+            }
         }
        
-        delete evt; // Critical: Delete the processed event object
+        delete evt; 
              
         if (numDone == processNum) { 
             totalSimTime = currentTime;
@@ -1013,22 +1020,35 @@ int main(int argc, char* argv[]) {
         }       
     };
 
-    // --- Printing Summary Statistics ---
+    // --- Step 4: Printing Summary Statistics (Aesthetic Changes Applied) ---
     
+    cout << "\n======================================================\n";
+    cout << "\t\tSCHEDULER RESULTS SUMMARY\n";
+    cout << "======================================================\n\n";
+
     if (schedulerType == "RR" || schedulerType == "PREPRIO" || schedulerType == "PRIO" || schedulerType == "BATTERY_AWARE"){ 
-        cout << schedulerType << " " << timeQuantum << endl;
+        cout << "SCHEDULER TYPE:\t" << schedulerType << " (Quantum: " << timeQuantum << ")" << endl;
     }
     else { 
-        cout << schedulerType << endl;        
+        cout << "SCHEDULER TYPE:\t" << schedulerType << endl;        
     }
     
     // Print battery and energy statistics
-    cout << "BATTERY_STATS: Initial=" << fixed << setprecision(2) << initialBattery 
-         << "% Final=" << batteryLevel << "% Drain=" << (initialBattery - batteryLevel) << "%" << endl;
-    cout << "ENERGY_STATS: Total=" << totalEnergyConsumed << "J Power_Avg=" << (totalSimTime > 0 ? (totalEnergyConsumed / totalSimTime) : 0) << "W" << endl;
-    cout << "MEMORY_STATS: Used=" << usedMemory << "MB Available=" << availableMemory << "MB Utilization=" << fixed << setprecision(2) << (totalMemory > 0 ? (100.0 * usedMemory / totalMemory) : 0) << "%" << endl;
-    cout << "DVFS_STATS: Final_Level=" << (currentDVFS == LOW_POWER ? "LOW_POWER" ;
-    currentDVFS == BALANCED ? "BALANCED" : "HIGH_PERF") << endl;      
+    cout << "\n--- ENERGY & DVFS MANAGEMENT ---\n";
+    cout << "BATTERY_STATS:\tInitial=" << fixed << setprecision(2) << initialBattery 
+         << "% \tFinal=" << batteryLevel << "% \tDrain=" << (initialBattery - batteryLevel) << "%" << endl;
+    cout << "ENERGY_STATS:\tTotal Energy=" << totalEnergyConsumed << "J \tPower Avg=" << setprecision(2) << (totalSimTime > 0 ? (totalEnergyConsumed / totalSimTime) : 0) << "W" << endl;
+    cout << "DVFS_STATS:\tFinal Level=" << (currentDVFS == LOW_POWER ? "LOW_POWER" :currentDVFS == BALANCED ? "BALANCED" : "HIGH_PERF") << endl;      
+
+// Inside main(), modify the MEMORY_STATS print:
+
+    cout << "\n--- MEMORY MANAGEMENT ---\n";
+    cout << "MEMORY_STATS:\tUsed (Final)=" << usedMemory << "MB \tPeak Used=" << peakUsedMemory << "MB" << "\tAvailable=" << availableMemory << "MB \tUtilization=" << fixed << setprecision(2) << (totalMemory > 0 ? (100.0 * usedMemory / totalMemory) : 0) << "%" << endl;
+    cout << "PEAK_UTILIZATION: " << fixed << setprecision(2) << (totalMemory > 0 ? (100.0 * peakUsedMemory / totalMemory) : 0) << "%" << endl; // Display peak utilization as well
+
+    cout << "\n--- PROCESS BREAKDOWN ---\n";
+    cout << " PID | AT | TC | CB | IB | P | FINISH | T_A_T | IO_TIME | WAIT_TIME" << endl;
+    cout << "------------------------------------------------------------------\n";
 
     vector<vector<int>> summary;
     vector<double> sum(6);
@@ -1047,14 +1067,16 @@ int main(int argc, char* argv[]) {
         CPUBusy += pcb->TCInit;
         totalTAT += pcb->turnAroundTime;
         totalWait += pcb->CPUWaitTime;
-        totalIOTime += pcb->IOTime; // Use summed IOTime for I/O utilization
+        totalIOTime += pcb->IOTime;
         totalEnergy += pcb->energyConsumed;
  
         delete pcb;
         processQ.pop();
     }
 
-    double IOBusy = (double)totalIOTime; // Simplified I/O busy time
+    if (totalSimTime == 0) totalSimTime = 1;
+
+    double IOBusy = (double)totalIOTime;
     double CPUtil = 100.0 * (CPUBusy) / totalSimTime;
     double IOUtil = 100.0 * (IOBusy) / totalSimTime;
     double avgTAT = totalTAT / double(processNum);
@@ -1069,45 +1091,43 @@ int main(int argc, char* argv[]) {
            avgWait,                 
            throughput};
     
-    // Print energy comparison if using energy-aware scheduler
-    if (schedulerType == "ENERGY_AWARE" || schedulerType == "BATTERY_AWARE") {
-        cout << "ENERGY_COMPARISON: Avg_Energy_Per_Process=" << fixed << setprecision(2) << avgEnergy << "J Energy_Efficiency=" << (totalEnergy > 0 ? (CPUBusy / totalEnergy) : 0) << " work/J" << endl;
-    }    
+    
 
     for (int i = 0; i < processNum; ++i) {
         int zerosToAdd = 4 - to_string(i).length();
         cout << string(zerosToAdd, '0') << i << ": ";
+        
+        // Print Input Parameters (AT, TC, CB, IB, P)
         for (int j = 0; j < 4; ++j) {
             cout << setw(4) << summary[i][j] << " ";
         }
-
         cout << setw(1) << summary[i][4] << " ";        
 
         cout << "|";
         
+        // Print Output Metrics (FINISH, T_A_T, IO_TIME, WAIT_TIME)
         for (int j = 5; j < 9; ++j) {
             cout << setw(6) << summary[i][j];
         }
         cout << endl;
     }
 
-    cout << "SUM: ";
-    for (int i = 0; i < 6; ++i) {
-        if (i == 0) {
-            cout << sum[i] << " ";
-        } 
-        
-        else if (i != 5) { 
-            printf("%.2f ", sum[i]);
-        }
+     // Print energy comparison if using energy-aware scheduler
+    if (schedulerType == "ENERGY_AWARE" || schedulerType == "BATTERY_AWARE") {
+        cout << "\nENERGY_COMPARISON: Avg_Energy_Per_Process=" << fixed << setprecision(2) << avgEnergy << "J \tEnergy_Efficiency=" << (totalEnergy > 0 ? (CPUBusy / totalEnergy) : 0) << " work/J" << endl;
+    }   
 
-        else if (i == 5) { 
-            printf("%.3f\n", sum[i]);
-        }
-    }
+    cout << "\n--- OVERALL SUMMARY ---\n";
+    cout << "\tTotal Time: " << sum[0] << endl;
+    cout << "\tCPU Utilization: "; printf("%.2f %%", sum[1]); cout << endl;
+    cout << "\tI/O Utilization: "; printf("%.2f %%", sum[2]); cout << endl;
+    cout << "\tAvg Turnaround: "; printf("%.2f", sum[3]); cout << endl;
+    cout << "\tAvg Wait Time: "; printf("%.2f", sum[4]); cout << endl;
+    cout << "\tThroughput: "; printf("%.3f proc/100 time units\n", sum[5]);
+
+    cout << "======================================================\n";
               
     delete scheduler;   
-    // Remaining events are deleted by the DESLayer::rmEvent or loop cleanup
     while (!eventQ.empty()) { 
         delete eventQ.front();
         eventQ.pop_front();
