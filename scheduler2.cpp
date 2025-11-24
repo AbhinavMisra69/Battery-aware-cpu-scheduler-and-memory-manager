@@ -29,12 +29,12 @@ int ofs = 1;
 
 
 // Battery and Power Management
-double batteryLevel = 100.0;  // Battery percentage (0-100)
-double initialBattery = 100.0;
+double batteryLevel = 52.0;  // Battery percentage (0-100)
+double initialBattery = 52.0;
 double powerConsumption = 0.0;  // Current power consumption in watts
 double totalEnergyConsumed = 0.0;  // Total energy consumed in Joules
 double idlePower = 0.5;  // Power consumption when idle (watts)
-double activePower = 2.0;  // Base power consumption when active (watts)
+double activePower = 15.0;  // Base power consumption when active (watts)
 double memoryPower = 0.3;  // Power per MB of active memory (watts/MB)
 
 // DVFS (Dynamic Voltage/Frequency Scaling) levels
@@ -844,8 +844,16 @@ int main(int argc, char* argv[]) {
     }
     else if (schedulerType == "ENERGY_AWARE") { scheduler = new ENERGY_AWARE(); timeQuantum = 10000; }
     else if (schedulerType == "BATTERY_AWARE") {
-        BATTERY_AWARE* s = new BATTERY_AWARE(); s->activeQVec.resize(maxPrio); s->expiredQVec.resize(maxPrio);
+        BATTERY_AWARE* s = new BATTERY_AWARE(); 
+        s->activeQVec.resize(maxPrio); 
+        s->expiredQVec.resize(maxPrio);
         scheduler = s;
+        
+        // --- TEMPORARY FIX TO FORCE LOW POWER ---
+        currentDVFS = LOW_POWER; // Set DVFS to the lowest power state immediately
+        // ----------------------------------------
+        //BATTERY_AWARE* s = new BATTERY_AWARE(); s->activeQVec.resize(maxPrio); s->expiredQVec.resize(maxPrio);
+        //scheduler = s;
     }
 
     list<Event*> eventQ;
